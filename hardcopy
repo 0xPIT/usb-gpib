@@ -1,0 +1,131 @@
+#!/usr/bin/env python
+
+import argparse,os,sys,tempfile,time
+try:
+   import serial
+except ImportError:
+   print "Serial library not found - install python-serial"
+   sys.exit(99)
+
+state=0
+byte=0
+
+def main():
+   p=argparse.ArgumentParser(description="Take hardcopy from Tek scope")
+   p.add_argument(dest="File", metavar="file", type=str, nargs="?", default="hardcopy.bmp",
+                  help="output file to write")
+   p.add_argument("-d","--port", dest="Device", action="store", default=0,
+                  help="serial port to use")
+   p.add_argument("-v","--verbose", dest="Verbose", action="store_true",
+                  help="Be more verbose")
+   p.add_argument("--debug", dest="Debug", action="store_true",
+                  help="Show commands and data")
+   args=p.parse_args()
+
+   if args.Device=="-":
+      class S:
+         def read(self,bytes=1<<14):return os.read(0,min(bytes,1<<14))
+         def write(self,data):return os.write(1,data)
+      usbgpib=S()
+   else:
+      usbgpib=serial.Serial(args.Device,timeout=5)
+
+   def w(data):
+      if args.Debug:
+         print "> %s"%repr(data)[1:-1]
+      usbgpib.write("%s\n"%data)
+
+   def r(binary=False):
+      global byte,state
+      data=""
+      while True:
+         d=usbgpib.read(1)
+         #print "state=%d d=%r"%(state,d)
+         if not binary:
+            if d==chr(13):
+               continue
+            if d==chr(10):
+               break
+         if d=="":
+            break
+         if state==0 and d=="\\":
+            state=1
+            byte=0
+         elif state==1:
+            if d>='0' and d<='3':
+               byte=64*int(d)
+               state=2
+            else:
+               data+=d
+               state=0
+         elif state==2:
+            byte+=8*int(d)
+            state=3
+         elif state==3:
+            byte+=int(d)
+            state=0
+            data+=chr(byte)
+         else:
+            data+=d
+         if binary and len(data)==256:
+            break
+      if args.Debug: print "< %s"%repr(data)[1:-1]
+      return data
+
+   for t in range(10):
+      data=r()
+      if "USB-GPIB" in data:
+         break
+      if not data:
+         w("++ver")
+
+   if "USB-GPIB" not in data:
+      print "USB-GPIB not found"
+      sys.exit(2)
+
+   w('rst')
+   r()
+   w('cac')
+   r()
+
+   w('write -"hardcopy:format bmp;port gpib;layout portrait"')
+   r()
+   w('write -"hardcopy start"')
+   time.sleep(0.2)
+   r()
+   w('read')
+   r()
+   data=""
+   while True:
+      d=r(True)
+      if d=="":
+         break
+      data+=d
+      if args.Verbose:
+        sys.stdout.write("%d\r"%len(data))
+        sys.stdout.flush()
+   if args.Verbose:
+        print
+   w("rst")
+
+   i=data.find("BM")
+   if i>=0 and i<200:
+      data=data[i:]
+   if data.endswith("\r\n++"):
+      data=data[:-4]
+
+   print "%d bytes"%len(data)
+   if args.File.endswith(".bmp"):
+      fd=file(args.File,"wb")
+      fd.write(data)
+   else:
+      fd=tempfile.NamedTemporaryFile("wb",suffix=".bmp")
+      fd.write(data)
+      fd.flush()
+      cmd="convert %s %s"%(fd.name,args.File)
+      if args.Verbose:print "$ %s"%cmd
+      os.system(cmd)
+      del fd
+
+if __name__=="__main__":
+   main()

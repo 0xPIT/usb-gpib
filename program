@@ -1,0 +1,125 @@
+#!/bin/sh
+set -e
+
+if [ $# -lt 3 ] || [ "$1" = "--help" ] ; then
+   echo "Called from Makefile to program USB-GPIB"
+   exit 1
+fi
+
+DASHV=
+DASHQ=-q
+if [ "$1" = "-v" ] ; then
+   shift
+   DASHV=-v
+   DASHQ=
+fi
+
+find_device() {
+   for F in /dev/ttyACM* ; do udevadm info --name $F ;done | awk '
+      BEGIN { name="";state=0 }
+      /^P:/ { if(state==111) state+=1000 }
+      /^E: ID_VENDOR_ID='$1'$/ { state+=1 }
+      /^E: ID_MODEL_ID='$2'$/ { state+=10 }
+      /^E: DEVNAME=/ { name=substr($2,9); print "   found " name >"/dev/stderr"; state+=100; }
+      END { if(state==111) { print name } else { exit 2 }}
+   '
+}
+
+MODE=
+if [ "$(lsusb -d 2341:8036 | wc -l)" = "1" ] ; then
+   DEV=$(find_device 2341 8036)
+   MODE=AVR109
+
+elif [ "$(lsusb -d 16c0:0478 | wc -l)" = "1" ] ; then
+   DEV=$(find_device 16c0 0478)
+   MODE=Teensy
+
+elif lsusb -d 16c0:05e1 >/dev/null ; then
+   echo "Detecting USB-GPIB on shared CDC USB ID"
+
+   DEV=$(
+      for F in /dev/ttyACM* ; do udevadm info --name $F ;done | awk '
+         BEGIN { name="";state=0 }
+         /^P:/ { if(state==111) state+=10000 }
+         /^N:/ { name=$2; state+=1; }
+         /^E: ID_MODEL=USB-GPIB-32U4/ { state+=10; }
+         /^E: ID_VENDOR=Frank_Kingswood__kingswood-consulting.co.uk$/ { state+=100; }
+         /^E: DEVNAME=/ { name=substr($2,9); print "   found " name >"/dev/stderr"; state+=1000; }
+         END { if(state==1111) { print name  }}
+      '
+   )
+
+   trap "true" ALRM
+   exec 3<>$DEV
+
+   set +e
+   for I in $(seq 3) ; do
+      (
+         sleep 0.3
+         kill -ALRM $$
+      ) &
+      while read X ; do echo $X ; done
+   done
+
+   V=
+   for I in $(seq 5) ; do
+      (
+         sleep 0.3
+         kill -ALRM $$
+      ) &
+      echo "++ver" >&3
+      read V <&3
+
+      case "$V" in
+         *USB-GPIB-32U4*)
+            echo "Found USB-GPIB"
+            break
+            ;;
+         *)
+            ;;
+      esac
+   done
+   set -e
+
+   # call the boot loader
+   case "$V" in
+      *Teensy*)
+         echo "++DEBUG 0x7e00" >&3
+         MODE=Teensy
+         ;;
+      *MicroPro*)
+         echo "++DEBUG 0x7800" >&3
+         MODE=AVR109
+         ;;
+      *)
+         exit 2
+         ;;
+   esac
+
+   exec 3>&-
+   sleep 0.5
+   trap - ALRM
+
+else
+   echo "No device or multiple devices found:"
+   echo
+   lsusb | grep -Pv "Linux Foundation .+ root hub"
+   exit 1
+fi
+
+echo "$MODE boot loader"
+
+if [ "$1" != "--program" ] ; then
+   exit 1
+fi
+
+sleep 1
+set -x
+case "$MODE" in
+   Teensy)
+      teensy_loader_cli -mmcu="$2" -w -v $DASHV "$3"
+      ;;
+   AVR109)
+      avrdude -c avr109 -P $DEV -p "$2" -q $DASHQ -U flash:w:"$3"
+      ;;
+esac
